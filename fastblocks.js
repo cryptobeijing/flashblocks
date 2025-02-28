@@ -113,21 +113,38 @@ function getLatestBlock() {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
-            'Content-Length': data.length
-        }
+            'Content-Length': data.length,
+            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            'Origin': 'https://sepolia.base.org',
+            'Host': 'sepolia.base.org'
+        },
+        timeout: 10000, // 10 second timeout
+        rejectUnauthorized: false // Allow self-signed certificates
     };
 
     const req = https.request(options, (res) => {
         let responseData = '';
+
+        // Check response status
+        if (res.statusCode !== 200) {
+            console.error(`Full Node returned status code: ${res.statusCode}`);
+            return;
+        }
 
         res.on('data', (chunk) => {
             responseData += chunk;
         });
 
         res.on('end', () => {
+            if (!responseData) {
+                console.error('Empty response from Full Node');
+                return;
+            }
+
             try {
                 const result = JSON.parse(responseData);
-                if (result.result) {
+                if (result && result.result) {
                     const block = result.result;
                     // Only send if it's a new block
                     if (block.number !== lastBlockNumber) {
@@ -145,25 +162,52 @@ function getLatestBlock() {
                         // Send to all connected SSE clients
                         const eventData = `data: ${JSON.stringify(blockData)}\n\n`;
                         sseClients.forEach(client => {
-                            client.write(eventData);
+                            try {
+                                client.write(eventData);
+                            } catch (e) {
+                                console.error('Error sending to SSE client:', e);
+                                sseClients.delete(client);
+                            }
                         });
                         
                         console.log('New Full Node Block:', blockData.number);
                     }
+                } else if (result.error) {
+                    console.error('Full Node RPC error:', result.error);
                 }
             } catch (e) {
                 console.error('Error parsing Full Node response:', e);
+                console.error('Raw response:', responseData);
             }
+        });
+
+        // Handle response timeout
+        res.setTimeout(10000, () => {
+            res.destroy();
+            console.error('Full Node response timeout');
         });
     });
 
+    // Handle request errors
     req.on('error', (error) => {
         console.error('Error fetching Full Node block:', error);
+        if (error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT') {
+            console.log('Connection error, will retry on next interval');
+        }
+    });
+
+    // Handle request timeout
+    req.setTimeout(10000, () => {
+        req.destroy();
+        console.error('Full Node request timeout');
     });
 
     req.write(data);
     req.end();
 }
+
+// Modify the polling interval for better stability
+const FULL_NODE_POLL_INTERVAL = 3000; // 3 seconds
 
 // Handle client WebSocket connections
 wss.on('connection', (ws) => {
@@ -182,7 +226,18 @@ server.listen(PORT, () => {
     console.log(`Server running at http://localhost:${PORT}`);
     console.log('Starting to monitor Base Sepolia blocks...');
     
-    // Start polling for full node data
-    getLatestBlock();
-    setInterval(getLatestBlock, 2000);
+    // Start polling for full node data with error handling
+    const pollFullNode = () => {
+        try {
+            getLatestBlock();
+        } catch (e) {
+            console.error('Error in full node polling:', e);
+        }
+    };
+
+    // Initial calls
+    pollFullNode();
+    
+    // Set up intervals with error handling
+    setInterval(pollFullNode, FULL_NODE_POLL_INTERVAL);
 }); 
