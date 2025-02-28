@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Base Sepolia Terminal Monitor</title>
+    <style>
+        body {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+            margin: 0;
+            padding: 0;
+            font-size: 14px;
+            line-height: 1.5;
+            height: 100vh;
+            overflow: hidden;
+        }
+        .split-terminal {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            height: 100vh;
+        }
+        .terminal {
+            padding: 20px;
+            overflow-y: auto;
+            border-right: 1px solid #333;
+        }
+        .terminal:last-child {
+            border-right: none;
+        }
+        .terminal-header {
+            position: sticky;
+            top: 0;
+            background: #1e1e1e;
+            padding-bottom: 10px;
+            margin-bottom: 20px;
+            border-bottom: 1px solid #333;
+            z-index: 1;
+        }
+        .status {
+            color: #666;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 5px;
+        }
+        .status .indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #666;
+        }
+        .status .indicator.connected {
+            background: #3fb950;
+        }
+        .output-line {
+            margin-bottom: 5px;
+            white-space: pre;
+            font-size: 13px;
+        }
+        .timestamp {
+            color: #666;
+        }
+        .block-number {
+            color: #b5cea8;
+        }
+        .hash {
+            color: #ce9178;
+        }
+        .gas {
+            color: #4ec9b0;
+        }
+        .status-success {
+            color: #3fb950;
+        }
+        .status-pending {
+            color: #d7ba7d;
+        }
+        .status-failed {
+            color: #f85149;
+        }
+        .address {
+            color: #ce9178;
+        }
+        .balance {
+            color: #b5cea8;
+        }
+        .change-positive {
+            color: #3fb950;
+        }
+        .change-negative {
+            color: #f85149;
+        }
+        .prompt {
+            color: #569cd6;
+            margin-bottom: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="split-terminal">
+        <!-- FlashBlocks Terminal -->
+        <div class="terminal">
+            <div class="terminal-header">
+                <div class="prompt">./flashblocks-monitor</div>
+                <div class="status">
+                    <span class="indicator" id="flash-status"></span>
+                    <span>Base FlashBlocks Monitor(NOW)</span>
+                </div>
+            </div>
+            <div id="flash-output"></div>
+        </div>
+
+        <!-- Full Node Terminal -->
+        <div class="terminal">
+            <div class="terminal-header">
+                <div class="prompt">./fullblocks-monitor</div>
+                <div class="status">
+                    <span class="indicator" id="full-status"></span>
+                    <span>Base Full Blocks Monitor</span>
+                </div>
+            </div>
+            <div id="full-output"></div>
+        </div>
+    </div>
+
+    <script>
+        let flashWs;
+        let fullEventSource;
+
+        function formatNumber(num) {
+            return new Intl.NumberFormat().format(num);
+        }
+
+        function truncateHash(hash) {
+            return hash.substring(0, 10) + '...' + hash.substring(hash.length - 8);
+        }
+
+        function formatBalance(balance) {
+            return (parseInt(balance, 16) / 1e18).toFixed(4) + ' ETH';
+        }
+
+        function formatBalanceChange(oldBalance, newBalance) {
+            const change = (parseInt(newBalance, 16) - parseInt(oldBalance, 16)) / 1e18;
+            const prefix = change > 0 ? '+' : '';
+            return prefix + change.toFixed(4) + ' ETH';
+        }
+
+        function getTimestamp() {
+            const now = new Date();
+            return now.toLocaleTimeString('en-US', { 
+                hour12: false, 
+                hour: '2-digit', 
+                minute: '2-digit', 
+                second: '2-digit',
+                fractionalSecondDigits: 3 
+            });
+        }
+
+        function addFlashOutput(text) {
+            const output = document.getElementById('flash-output');
+            const line = document.createElement('div');
+            line.className = 'output-line';
+            line.innerHTML = `<span class="timestamp">[${getTimestamp()}]</span> ${text}`;
+            output.appendChild(line);
+            // Scroll to bottom
+            output.scrollTop = output.scrollHeight;
+        }
+
+        function addFullOutput(text) {
+            const output = document.getElementById('full-output');
+            const line = document.createElement('div');
+            line.className = 'output-line';
+            line.innerHTML = `<span class="timestamp">[${getTimestamp()}]</span> ${text}`;
+            output.insertBefore(line, output.firstChild);
+        }
+
+        function initFlashWebSocket() {
+            flashWs = new WebSocket('ws://localhost:8080');
+            
+            flashWs.onopen = () => {
+                document.getElementById('flash-status').classList.add('connected');
+            };
+
+            flashWs.onclose = () => {
+                document.getElementById('flash-status').classList.remove('connected');
+                addFlashOutput('Connection lost. Reconnecting...');
+                setTimeout(initFlashWebSocket, 2000);
+            };
+
+            flashWs.onmessage = (event) => {
+                const message = JSON.parse(event.data);
+                
+                // Only process flash messages
+                if (message.type !== 'flash') return;
+                
+                const data = message.data;
+                const output = document.getElementById('flash-output');
+                
+                // Create a container for the new block info
+                const blockContainer = document.createElement('div');
+                
+                // Add empty line for readability
+                const emptyLine = document.createElement('div');
+                emptyLine.className = 'output-line';
+                emptyLine.innerHTML = `<span class="timestamp">[${getTimestamp()}]</span> `;
+                blockContainer.appendChild(emptyLine);
+                
+                // Add block info in correct order
+                const lines = [
+                    `New Block <span class="block-number">#${data.metadata.block_number}</span>`,
+                    `├─ Gas Used: <span class="gas">${formatNumber(parseInt(data.diff.gas_used, 16))}</span>`,
+                    `└─ Transactions: <span class="block-number">${data.diff.transactions.length}</span>`
+                ];
+                
+                lines.forEach(text => {
+                    const line = document.createElement('div');
+                    line.className = 'output-line';
+                    line.innerHTML = `<span class="timestamp">[${getTimestamp()}]</span> ${text}`;
+                    blockContainer.appendChild(line);
+                });
+
+                // Add transactions
+                data.diff.transactions.forEach(tx => {
+                    const hash = typeof tx === 'string' ? tx : tx.hash;
+                    const receipt = data.metadata.receipts[hash];
+                    const status = receipt ? 
+                        (receipt.status === '0x1' ? 
+                            '<span class="status-success">✅</span>' : 
+                            '<span class="status-failed">❌</span>') : 
+                        '<span class="status-pending">⏳</span>';
+                    
+                    const line = document.createElement('div');
+                    line.className = 'output-line';
+                    line.innerHTML = `<span class="timestamp">[${getTimestamp()}]</span>    TX <span class="hash">${truncateHash(hash)}</span> ${status}`;
+                    blockContainer.appendChild(line);
+                });
+
+                // Insert the new block info at the beginning
+                output.insertBefore(blockContainer, output.firstChild);
+            };
+        }
+
+        function initFullNodeEvents() {
+            fullEventSource = new EventSource('/events');
+            document.getElementById('full-status').classList.add('connected');
+            addFullOutput('Connected to Full Blocks');
+
+            fullEventSource.onmessage = function(event) {
+                const block = JSON.parse(event.data);
+                const output = document.getElementById('full-output');
+                
+                // Create a container for the new block info
+                const blockContainer = document.createElement('div');
+                
+                // Add empty line for readability
+                const emptyLine = document.createElement('div');
+                emptyLine.className = 'output-line';
+                emptyLine.innerHTML = `<span class="timestamp">[${getTimestamp()}]</span> `;
+                blockContainer.appendChild(emptyLine);
+                
+                // Add block info in correct order
+                const lines = [
+                    `New Block <span class="block-number">#${block.number}</span>`,
+                    `├─ Hash: <span class="hash">${truncateHash(block.hash)}</span>`,
+                    `├─ Gas Used: <span class="gas">${formatNumber(block.gasUsed)}</span>`,
+                    `└─ Transactions: <span class="block-number">${block.transactions}</span>`
+                ];
+                
+                lines.forEach(text => {
+                    const line = document.createElement('div');
+                    line.className = 'output-line';
+                    line.innerHTML = `<span class="timestamp">[${getTimestamp()}]</span> ${text}`;
+                    blockContainer.appendChild(line);
+                });
+
+                // Insert the new block info at the beginning
+                output.insertBefore(blockContainer, output.firstChild);
+            };
+
+            fullEventSource.onerror = function() {
+                document.getElementById('full-status').classList.remove('connected');
+                addFullOutput('Connection lost. Reconnecting...');
+            };
+        }
+
+        // Initialize everything
+        initFlashWebSocket();
+        initFullNodeEvents();
+    </script>
+</body>
+</html> 
